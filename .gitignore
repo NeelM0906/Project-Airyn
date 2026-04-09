@@ -1,0 +1,18 @@
+venv/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+
+# Large files - data and checkpoints
+data/
+checkpoints/
+logs/
+
+# OS
+*.lnk
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Parameter-golf upstream (reference only, not part of Airyn)
+parameter-golf/
