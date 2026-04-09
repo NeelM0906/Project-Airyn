@@ -12,8 +12,6 @@ Usage:
 from __future__ import annotations
 
 import os
-os.environ.setdefault("USE_LIBUV", "0")  # Windows PyTorch nightly lacks libuv
-
 import copy
 import glob
 import math
@@ -510,11 +508,6 @@ class MoELayer(nn.Module):
                 for i in range(self.n_experts):
                     load[i] = (topk_indices == i).float().sum()
                 if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-                    if load.device.type == "cuda" and dist.get_backend() == "gloo":
-                        load_cpu = load.cpu()
-                        dist.all_reduce(load_cpu, op=dist.ReduceOp.SUM)
-                        load.copy_(load_cpu.to(load.device))
-                    else:
                         dist.all_reduce(load, op=dist.ReduceOp.SUM)
                 self.expert_bias.add_(0.001 * (load.mean() - load))
 
@@ -702,10 +695,11 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        if sys.platform == "win32":
-            dist.init_process_group(backend="gloo")
-        else:
-            dist.init_process_group(backend="nccl", device_id=device)
+        # NCCL tuning for single-node multi-GPU
+        os.environ.setdefault("NCCL_IB_DISABLE", "1")        # No InfiniBand on single node
+        os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")       # Use NVLink if available
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")     # Prefer loopback for single node
+        dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
 
