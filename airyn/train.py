@@ -296,6 +296,18 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
+    def skip(self, n: int) -> None:
+        """Advance the stream position by n tokens without reading into memory."""
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            self.pos += k
+            remaining -= k
+
 
 class DistributedTokenLoader:
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
@@ -307,9 +319,15 @@ class DistributedTokenLoader:
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        # Skip tokens belonging to earlier ranks (avoid reading all ranks' data)
+        if self.rank > 0:
+            self.stream.skip(per_rank_span * self.rank)
+        # Read only this rank's portion
+        local = self.stream.take(per_rank_span).to(dtype=torch.int64)
+        # Skip tokens belonging to later ranks to keep stream position in sync
+        remaining_ranks = self.world_size - self.rank - 1
+        if remaining_ranks > 0:
+            self.stream.skip(per_rank_span * remaining_ranks)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
