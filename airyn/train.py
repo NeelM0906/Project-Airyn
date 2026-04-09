@@ -210,14 +210,14 @@ def eval_val(
     val_tokens: Tensor,
 ) -> float:
     """Compute cross-entropy validation loss over the full validation set."""
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    total_val_seqs = args.val_batch_size // args.train_seq_len
+    local_batch_seqs = max(1, total_val_seqs // (world_size * grad_accum_steps))
+    if local_batch_seqs < 1:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
@@ -317,7 +317,10 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        # Compute in sequence units to ensure divisibility by seq_len
+        total_seqs = global_tokens // seq_len
+        seqs_per_micro = max(1, total_seqs // (self.world_size * grad_accum_steps))
+        local_tokens = seqs_per_micro * seq_len
         per_rank_span = local_tokens + 1
         # Skip tokens belonging to earlier ranks (avoid reading all ranks' data)
         if self.rank > 0:
@@ -704,9 +707,10 @@ def main() -> None:
         grad_accum_steps = args.grad_accum_steps
     else:
         # Target ~524k tokens per step regardless of GPU count
-        local_batch_tokens = args.train_batch_tokens // world_size
-        local_batch_seqs = local_batch_tokens // args.train_seq_len
-        grad_accum_steps = max(1, local_batch_seqs)
+        # Work in sequence units to avoid non-divisible token counts
+        total_seqs = args.train_batch_tokens // args.train_seq_len
+        seqs_per_gpu = total_seqs // world_size
+        grad_accum_steps = max(1, seqs_per_gpu)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
