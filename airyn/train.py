@@ -69,6 +69,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    model_size = os.environ.get("MODEL_SIZE", "")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -269,10 +270,13 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    def __init__(self, pattern: str):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+    def __init__(self, files_or_pattern):
+        if isinstance(files_or_pattern, str):
+            self.files = [Path(p) for p in sorted(glob.glob(files_or_pattern))]
+        else:
+            self.files = list(files_or_pattern)
         if not self.files:
-            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+            raise FileNotFoundError(f"No files found: {files_or_pattern}")
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
@@ -310,11 +314,11 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, files_or_pattern, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(files_or_pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         # Compute in sequence units to ensure divisibility by seq_len
@@ -500,6 +504,7 @@ class MoELayer(nn.Module):
         # Auxfree bias is updated manually from observed routing load and should stay in fp32.
         self.register_buffer("expert_bias", torch.zeros(n_experts, dtype=torch.float32))
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         x_flat = x.reshape(-1, dim)
@@ -688,7 +693,24 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     args = Hyperparameters()
-    model_torch_compile = args.torch_compile and args.ffn_type != "moe"
+
+    # --- MODEL_SIZE presets ---
+    MODEL_PRESETS = {
+        "124m": dict(model_dim=768,  num_layers=12, num_heads=12, train_seq_len=1024),
+        "350m": dict(model_dim=1024, num_layers=24, num_heads=16, train_seq_len=2048),
+        "760m": dict(model_dim=1536, num_layers=24, num_heads=16, train_seq_len=2048),
+        "1b":   dict(model_dim=2048, num_layers=24, num_heads=16, train_seq_len=2048),
+    }
+    if args.model_size in MODEL_PRESETS:
+        preset = MODEL_PRESETS[args.model_size]
+        for key, val in preset.items():
+            env_key = key.upper()
+            if not os.environ.get(env_key):
+                setattr(args, key, val)
+        if not os.environ.get("NUM_KV_HEADS"):
+            args.num_kv_heads = args.num_heads
+
+    model_torch_compile = args.torch_compile
     if args.torch_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -769,13 +791,25 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    dataset_dir = Path(args.data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    if args.ffn_type == "moe" and args.torch_compile:
-        log0("ffn_type:moe disables model torch.compile because expert routing uses dynamic control flow")
+    # --- Build train file list (supports comma-separated DATA_PATH) ---
+    data_paths = [p.strip() for p in args.data_path.split(",") if p.strip()]
+    train_file_list: list[Path] = []
+    for dp in data_paths:
+        dp_path = Path(dp).resolve()
+        found = sorted(dp_path.glob("*_train_*.bin"))
+        if not found:
+            found = sorted(dp_path.glob("*train*.bin"))
+        train_file_list.extend(found)
+        log0(f"train_loader:dataset:{dp_path.name} shards:{len(found)}")
+    if not train_file_list:
+        raise FileNotFoundError(f"No training shards found in: {data_paths}")
+    random.shuffle(train_file_list)
+    log0(f"train_loader:total_shards:{len(train_file_list)} from {len(data_paths)} data path(s)")
+
+    # Validation always uses fineweb10B
+    val_pattern = os.path.join("data/fineweb10B", "fineweb_val_*.bin")
+    val_tokens = load_validation_tokens(val_pattern, args.train_seq_len)
+    log0(f"val_loader:pattern={val_pattern} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -947,6 +981,7 @@ def main() -> None:
                     "muon_backend_steps": args.muon_backend_steps,
                     "grad_clip_norm": args.grad_clip_norm,
                     "ckpt_every": args.ckpt_every,
+                    "model_size": args.model_size,
                 },
             )
             # Use training step as the x-axis for all metrics
@@ -965,7 +1000,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(train_file_list, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1005,7 +1040,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(train_file_list, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
