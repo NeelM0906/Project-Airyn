@@ -710,7 +710,7 @@ def main() -> None:
         if not os.environ.get("NUM_KV_HEADS"):
             args.num_kv_heads = args.num_heads
 
-    model_torch_compile = args.torch_compile
+    model_torch_compile = args.torch_compile and args.ffn_type != "moe"
     if args.torch_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -857,7 +857,10 @@ def main() -> None:
         compiled_model = torch.compile(base_model, dynamic=False)
     else:
         compiled_model = base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
+    if args.ffn_type == "moe":
+        ddp_kwargs["find_unused_parameters"] = True
+    model: nn.Module = DDP(compiled_model, **ddp_kwargs) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR / TIED_EMBED_LR
