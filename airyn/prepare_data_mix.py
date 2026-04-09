@@ -174,7 +174,8 @@ def download_and_tokenize_pretraining(
     def load_with_retry(hf_id: str, subset: str | None, max_retries: int = 3):
         for attempt in range(max_retries):
             try:
-                kwargs = {"path": hf_id, "split": "train", "streaming": True}
+                kwargs = {"path": hf_id, "split": "train", "streaming": True,
+                          "trust_remote_code": True}
                 if subset is not None:
                     kwargs["name"] = subset
                 return load_dataset(**kwargs)
@@ -236,7 +237,7 @@ def download_and_tokenize_pretraining(
 # SFT dataset download (JSONL)
 # ---------------------------------------------------------------------------
 
-def download_sft(name: str, hf_id: str, output_path: str) -> dict:
+def download_sft(name: str, hf_id: str, output_path: str, config: str | None = None) -> dict:
     """Download an SFT dataset and save each row as JSONL."""
     from datasets import load_dataset
 
@@ -247,11 +248,16 @@ def download_sft(name: str, hf_id: str, output_path: str) -> dict:
         return {"name": name, "path": str(out), "examples": lines, "status": "skipped"}
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    log(f"[{name}] Downloading SFT: {hf_id}")
+    label = f"{hf_id} ({config})" if config else hf_id
+    log(f"[{name}] Downloading SFT: {label}")
 
     for attempt in range(3):
         try:
-            ds = load_dataset(hf_id, split="train", streaming=True)
+            kwargs = {"path": hf_id, "split": "train", "streaming": True,
+                      "trust_remote_code": True}
+            if config is not None:
+                kwargs["name"] = config
+            ds = load_dataset(**kwargs)
             break
         except Exception as e:
             if attempt < 2:
@@ -300,6 +306,10 @@ def main() -> None:
     except ImportError:
         os.system(f"{sys.executable} -m pip install datasets --break-system-packages")
         from datasets import load_dataset  # noqa: F401
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        os.system(f"{sys.executable} -m pip install zstandard --break-system-packages")
 
     log(f"Data preparation starting with {num_workers} tokenizer workers")
 
@@ -330,7 +340,10 @@ def main() -> None:
     sft_configs = [
         {"name": "tulu3_sft", "hf_id": "allenai/tulu-3-sft-mixture", "output_path": "data/sft/tulu3_sft.jsonl"},
         {"name": "openr1_math", "hf_id": "open-r1/OpenR1-Math-220k", "output_path": "data/sft/openr1_math.jsonl"},
-        {"name": "dolphin_r1", "hf_id": "cognitivecomputations/dolphin-r1", "output_path": "data/sft/dolphin_r1.jsonl"},
+        {"name": "dolphin_r1_reasoning", "hf_id": "cognitivecomputations/dolphin-r1", "config": "reasoning",
+         "output_path": "data/sft/dolphin_r1_reasoning.jsonl"},
+        {"name": "dolphin_r1_nonreasoning", "hf_id": "cognitivecomputations/dolphin-r1", "config": "nonreasoning",
+         "output_path": "data/sft/dolphin_r1_nonreasoning.jsonl"},
     ]
 
     manifest: dict = {"datasets": [], "started": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -359,7 +372,7 @@ def main() -> None:
 
         for cfg in sft_configs:
             try:
-                result = download_sft(cfg["name"], cfg["hf_id"], cfg["output_path"])
+                result = download_sft(cfg["name"], cfg["hf_id"], cfg["output_path"], cfg.get("config"))
                 manifest["datasets"].append(result)
             except Exception as e:
                 log(f"[{cfg['name']}] FAILED: {e}")
