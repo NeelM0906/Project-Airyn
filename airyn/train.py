@@ -92,7 +92,10 @@ class Hyperparameters:
     wandb_project = os.environ.get("WANDB_PROJECT", "airyn")
     wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1")))
     eval_hellaswag = bool(int(os.environ.get("EVAL_HELLASWAG", "0")))
-    ffn_type = os.environ.get("FFN_TYPE", "swiglu")  # "relu_sq" | "swiglu"
+    ffn_type = os.environ.get("FFN_TYPE", "swiglu")  # "relu_sq" | "swiglu" | "moe"
+    n_experts = int(os.environ.get("N_EXPERTS", 8))
+    n_active_experts = int(os.environ.get("N_ACTIVE_EXPERTS", 2))
+    n_shared_experts = int(os.environ.get("N_SHARED_EXPERTS", 1))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))  # 0 to disable
 
 # Parameter name patterns identifying control/scalar tensors (optimizer split).
@@ -428,11 +431,18 @@ class MLP(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int | None = None, *, hidden_dim: int | None = None):
         super().__init__()
-        # 2/3 factor compensates for the extra gate projection to keep ~same param count as MLP
-        hidden = int(2 / 3 * mlp_mult * dim)
-        hidden = ((hidden + 127) // 128) * 128  # round up to nearest multiple of 128
+        if hidden_dim is None:
+            if mlp_mult is None:
+                raise ValueError("SwiGLU requires mlp_mult or hidden_dim")
+            # 2/3 factor compensates for the extra gate projection to keep ~same param count as MLP
+            hidden = int(2 / 3 * mlp_mult * dim)
+            hidden = ((hidden + 127) // 128) * 128  # round up to nearest multiple of 128
+        else:
+            hidden = hidden_dim
+        if hidden <= 0:
+            raise ValueError(f"SwiGLU hidden dim must be positive, got {hidden}")
         self.gate = CastedLinear(dim, hidden, bias=False)
         self.up = CastedLinear(dim, hidden, bias=False)
         self.down = CastedLinear(hidden, dim, bias=False)
@@ -440,6 +450,72 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class MoELayer(nn.Module):
+    """Mixture of Experts with sigmoid routing and auxfree load balancing."""
+
+    def __init__(self, dim: int, expert_hidden_dim: int, n_experts: int = 8, n_active: int = 2, n_shared: int = 1):
+        super().__init__()
+        if n_experts <= 0:
+            raise ValueError(f"n_experts must be positive, got {n_experts}")
+        if n_active <= 0 or n_active > n_experts:
+            raise ValueError(f"n_active must be in [1, n_experts], got n_active={n_active}, n_experts={n_experts}")
+        if n_shared < 0:
+            raise ValueError(f"n_shared must be non-negative, got {n_shared}")
+        self.n_experts = n_experts
+        self.n_active = n_active
+
+        # Router uses sigmoid gating rather than softmax so tokens can independently score experts.
+        self.router = CastedLinear(dim, n_experts, bias=False)
+
+        # Routed experts are SwiGLU FFNs with an explicit hidden dimension.
+        self.experts = nn.ModuleList([SwiGLU(dim, hidden_dim=expert_hidden_dim) for _ in range(n_experts)])
+
+        # Shared expert is always added on top of the routed expert mixture.
+        self.shared_expert = SwiGLU(dim, hidden_dim=expert_hidden_dim) if n_shared > 0 else None
+
+        # Auxfree bias is updated manually from observed routing load and should stay in fp32.
+        self.register_buffer("expert_bias", torch.zeros(n_experts, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        x_flat = x.reshape(-1, dim)
+
+        router_logits = self.router(x_flat).float() + self.expert_bias
+        scores = torch.sigmoid(router_logits)
+        topk_scores, topk_indices = torch.topk(scores, k=self.n_active, dim=-1)
+        topk_weights = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-6)
+
+        output = torch.zeros_like(x_flat)
+        for i in range(self.n_experts):
+            mask = (topk_indices == i).any(dim=-1)
+            if not mask.any():
+                continue
+            expert_input = x_flat[mask]
+            expert_output = self.experts[i](expert_input)
+            weight_idx = (topk_indices[mask] == i).float()
+            weight = (topk_weights[mask] * weight_idx).sum(dim=-1, keepdim=True).to(dtype=expert_output.dtype)
+            output[mask] += weight * expert_output
+
+        if self.shared_expert is not None:
+            output = output + self.shared_expert(x_flat).to(dtype=output.dtype)
+
+        if self.training:
+            with torch.no_grad():
+                load = torch.zeros(self.n_experts, device=x.device, dtype=torch.float32)
+                for i in range(self.n_experts):
+                    load[i] = (topk_indices == i).float().sum()
+                if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    if load.device.type == "cuda" and dist.get_backend() == "gloo":
+                        load_cpu = load.cpu()
+                        dist.all_reduce(load_cpu, op=dist.ReduceOp.SUM)
+                        load.copy_(load_cpu.to(load.device))
+                    else:
+                        dist.all_reduce(load, op=dist.ReduceOp.SUM)
+                self.expert_bias.add_(0.001 * (load.mean() - load))
+
+        return output.reshape(bsz, seqlen, dim)
 
 
 class Block(nn.Module):
@@ -572,6 +648,7 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     args = Hyperparameters()
+    model_torch_compile = args.torch_compile and args.ffn_type != "moe"
     if args.torch_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -579,12 +656,13 @@ def main() -> None:
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = "RANK" in os.environ and requested_world_size > 1
+    rank = int(os.environ.get("RANK", "0")) if distributed else 0
+    world_size = requested_world_size if distributed else 1
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size <= 0:
-        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if requested_world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {requested_world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
@@ -650,6 +728,8 @@ def main() -> None:
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.ffn_type == "moe" and args.torch_compile:
+        log0("ffn_type:moe disables model torch.compile because expert routing uses dynamic control flow")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -657,10 +737,20 @@ def main() -> None:
 
     # FFN factory based on ffn_type
     ffn_factory = None
-    if args.ffn_type == "swiglu":
+    expert_hidden = None
+    if args.ffn_type == "moe":
+        swiglu_hidden = args.mlp_mult * args.model_dim
+        swiglu_hidden = int(swiglu_hidden * 2 / 3)
+        swiglu_hidden = swiglu_hidden - (swiglu_hidden % 128) or 128
+        expert_hidden = swiglu_hidden // args.n_active_experts
+        expert_hidden = expert_hidden - (expert_hidden % 64) or 64
+
+        def ffn_factory(dim: int, _hidden_dim: int) -> nn.Module:
+            return MoELayer(dim, expert_hidden, args.n_experts, args.n_active_experts, args.n_shared_experts)
+    elif args.ffn_type == "swiglu":
         ffn_factory = lambda dim, mlp_mult: SwiGLU(dim, mlp_mult)
     elif args.ffn_type != "relu_sq":
-        raise ValueError(f"Unknown FFN_TYPE={args.ffn_type!r}, expected 'relu_sq' or 'swiglu'")
+        raise ValueError(f"Unknown FFN_TYPE={args.ffn_type!r}, expected 'relu_sq', 'swiglu', or 'moe'")
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -680,7 +770,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if args.torch_compile:
+    for module in base_model.modules():
+        if isinstance(module, MoELayer):
+            module.expert_bias = module.expert_bias.float()
+    if model_torch_compile:
         compiled_model = torch.compile(base_model, dynamic=False)
     else:
         compiled_model = base_model
@@ -737,8 +830,16 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if args.ffn_type == "moe":
+        expert_params_per_layer = sum(p.numel() for p in base_model.blocks[0].mlp.experts[0].parameters())
+        active_expert_params = expert_params_per_layer * args.n_active_experts * len(base_model.blocks)
+        shared_params = sum(p.numel() for p in base_model.blocks[0].mlp.shared_expert.parameters()) * len(base_model.blocks) if args.n_shared_experts > 0 else 0
+        non_expert_params = n_params - sum(p.numel() for p in base_model.blocks.parameters()) + sum(p.numel() for p in base_model.blocks[0].attn.parameters()) * len(base_model.blocks) + sum(p.numel() for p in base_model.blocks[0].attn_norm.parameters()) * len(base_model.blocks) + sum(p.numel() for p in base_model.blocks[0].mlp_norm.parameters()) * len(base_model.blocks)
+        log0(f"moe_config: {args.n_experts} experts, top-{args.n_active_experts}, {args.n_shared_experts} shared")
+        log0(f"expert_hidden_dim: {expert_hidden}")
+        log0(f"total_params:{n_params:,} active_approx:{n_params - (args.n_experts - args.n_active_experts) * expert_params_per_layer * len(base_model.blocks):,}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"ffn_type:{args.ffn_type} torch_compile:{args.torch_compile}")
+    log0(f"ffn_type:{args.ffn_type} torch_compile:{model_torch_compile}")
     log0(f"attention_mode:{'gqa' if args.num_kv_heads != args.num_heads else 'mha'} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -900,6 +1001,9 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms "
                 f"tok/s:{throughput:.0f}"
             )
+            if args.ffn_type == "moe" and (step + 1) % 50 == 0:
+                biases = base_model.blocks[0].mlp.expert_bias
+                log0(f"expert_load_bias: {biases.tolist()}")
             if _wandb_active:
                 current_lr = scale * args.matrix_lr
                 wandb.log({
