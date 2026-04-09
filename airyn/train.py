@@ -97,6 +97,7 @@ class Hyperparameters:
     n_active_experts = int(os.environ.get("N_ACTIVE_EXPERTS", 2))
     n_shared_experts = int(os.environ.get("N_SHARED_EXPERTS", 1))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))  # 0 to disable
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 0))  # 0 = auto-compute to keep ~524k tokens per step
 
 # Parameter name patterns identifying control/scalar tensors (optimizer split).
 CONTROL_TENSOR_NAME_PATTERNS = (
@@ -663,9 +664,13 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if requested_world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {requested_world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if args.grad_accum_steps > 0:
+        grad_accum_steps = args.grad_accum_steps
+    else:
+        # Target ~524k tokens per step regardless of GPU count
+        local_batch_tokens = args.train_batch_tokens // world_size
+        local_batch_seqs = local_batch_tokens // args.train_seq_len
+        grad_accum_steps = max(1, local_batch_seqs)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
