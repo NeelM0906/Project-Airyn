@@ -16,3 +16,4 @@ Thumbs.db
 
 # Parameter-golf upstream (reference only, not part of Airyn)
 parameter-golf/
+wandb/
