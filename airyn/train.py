@@ -932,11 +932,28 @@ def main() -> None:
                     "tie_embeddings": args.tie_embeddings,
                     "matrix_lr": args.matrix_lr,
                     "scalar_lr": args.scalar_lr,
+                    "embed_lr": token_lr,
+                    "head_lr": args.head_lr,
                     "ffn_type": args.ffn_type,
                     "n_params": n_params,
                     "world_size": world_size,
+                    "grad_accum_steps": grad_accum_steps,
+                    "warmup_steps": args.warmup_steps,
+                    "warmdown_iters": args.warmdown_iters,
+                    "seed": args.seed,
+                    "rope_base": args.rope_base,
+                    "logit_softcap": args.logit_softcap,
+                    "muon_momentum": args.muon_momentum,
+                    "muon_backend_steps": args.muon_backend_steps,
+                    "grad_clip_norm": args.grad_clip_norm,
+                    "ckpt_every": args.ckpt_every,
                 },
             )
+            # Use training step as the x-axis for all metrics
+            wandb.define_metric("step")
+            wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("val/*", step_metric="step")
+            wandb.define_metric("gpu/*", step_metric="step")
             _wandb_active = True
             log0(f"wandb: logging to project '{args.wandb_project}' run '{args.run_id}'")
         except Exception as e:
