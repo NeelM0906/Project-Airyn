@@ -1074,10 +1074,23 @@ def main() -> None:
             dist.barrier()
 
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        tokens_seen = (step + 1) * args.train_batch_tokens
+        throughput = tokens_seen / (approx_training_time_ms / 1000.0) if approx_training_time_ms > 0 else 0
+
+        # Log to wandb every step for full-resolution loss curves
+        if _wandb_active:
+            current_lr = scale * args.matrix_lr
+            wandb.log({
+                "step": step + 1,
+                "train/loss": train_loss.item(),
+                "train/lr": current_lr,
+                "train/tokens_seen": tokens_seen,
+                "train/throughput_tok_per_sec": throughput,
+            }, step=step + 1)
+
+        # Console/file logging at reduced frequency
         should_log_train = args.train_log_every > 0 and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0)
         if should_log_train:
-            tokens_seen = (step + 1) * args.train_batch_tokens
-            throughput = tokens_seen / (approx_training_time_ms / 1000.0) if approx_training_time_ms > 0 else 0
             log0(
                 f"step:{step + 1}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms "
@@ -1086,14 +1099,6 @@ def main() -> None:
             if args.ffn_type == "moe" and (step + 1) % 50 == 0:
                 biases = base_model.blocks[0].mlp.expert_bias
                 log0(f"expert_load_bias: {biases.tolist()}")
-            if _wandb_active:
-                current_lr = scale * args.matrix_lr
-                wandb.log({
-                    "train/loss": train_loss.item(),
-                    "train/lr": current_lr,
-                    "train/tokens_seen": tokens_seen,
-                    "train/throughput_tok_per_sec": throughput,
-                }, step=step + 1)
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
