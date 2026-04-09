@@ -6,10 +6,16 @@ Modular LLM training harness forked from [OpenAI parameter-golf](https://github.
 
 ```
 airyn/
-  train.py          -- Main training script (~124M GPT-2 baseline, Muon optimizer)
+  train.py          -- Main training script (~124M GPT-2, Muon optimizer, SwiGLU default)
   prepare_data.py   -- Downloads FineWeb-Edu and tokenizes to GPT-2 .bin shards
+  generate.py       -- Inference / interactive generation
+  sft.py            -- Supervised fine-tuning on instruction datasets
+  eval.py           -- Benchmark evaluation (HellaSwag, LAMBADA)
+  report.py         -- Step 1 baseline PDF report generator
+  report_swiglu.py  -- Step 2 SwiGLU ablation PDF report generator
 parameter-golf/     -- Upstream reference (read-only, do not modify)
 data/fineweb10B/    -- GPT-2 tokenized shards (fineweb_train_*.bin, fineweb_val_*.bin)
+reports/            -- Generated PDF reports and chart images
 venv/               -- Python 3.12 virtualenv (PyTorch nightly + CUDA 12.8)
 ```
 
@@ -51,10 +57,11 @@ WANDB_ENABLED=0 venv/Scripts/torchrun --nproc_per_node=1 airyn/train.py
 
 - GPT-2 tokenizer (vocab 50304 = 50257 padded to 128) instead of SentencePiece
 - Full MHA (num_kv_heads = num_heads = 12) for baseline, not GQA
-- relu^2 MLP activation (from modded-nanogpt), will swap to SwiGLU later
+- SwiGLU FFN activation (default); relu^2 available via FFN_TYPE=relu_sq
 - Logit softcap at 30.0 (tanh-based)
 - CastedLinear keeps weights fp32, casts to bf16 at matmul time
-- torch.compile with fullgraph=True on model, and on Newton-Schulz
+- torch.compile on model and Newton-Schulz (disable with TORCH_COMPILE=0)
+- Chunked cross-entropy in forward pass (avoids OOM without torch.compile)
 
 ## Conventions
 
@@ -67,7 +74,7 @@ WANDB_ENABLED=0 venv/Scripts/torchrun --nproc_per_node=1 airyn/train.py
 
 ## Roadmap
 
-1. **Baseline** (current): ~124M param GPT-2 class model, Muon, fineweb10B
-2. **SwiGLU**: swap MLP via ffn_factory
-3. **HellaSwag eval**: eval_hellaswag flag
+1. **Baseline** (done): ~124M param GPT-2 class model, Muon, fineweb10B
+2. **SwiGLU** (done): SwiGLU FFN via ffn_factory, ablation shows lower loss/faster/less VRAM
+3. **Full SwiGLU training**: 5000-step run with SwiGLU default
 4. **Scaling experiments**: larger models, longer training, multi-node

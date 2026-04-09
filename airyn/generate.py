@@ -34,12 +34,16 @@ from airyn.train import (
     GPT,
     CastedLinear,
     Hyperparameters,
+    SwiGLU,
     restore_low_dim_params_to_fp32,
 )
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> GPT:
     args = Hyperparameters()
+    ffn_factory = None
+    if args.ffn_type == "swiglu":
+        ffn_factory = lambda dim, mlp_mult: SwiGLU(dim, mlp_mult)
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -52,6 +56,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> GPT:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        ffn_factory=ffn_factory,
     )
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(state_dict, strict=True)

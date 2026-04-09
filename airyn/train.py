@@ -92,6 +92,8 @@ class Hyperparameters:
     wandb_project = os.environ.get("WANDB_PROJECT", "airyn")
     wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1")))
     eval_hellaswag = bool(int(os.environ.get("EVAL_HELLASWAG", "0")))
+    ffn_type = os.environ.get("FFN_TYPE", "swiglu")  # "relu_sq" | "swiglu"
+    torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))  # 0 to disable
 
 # Parameter name patterns identifying control/scalar tensors (optimizer split).
 CONTROL_TENSOR_NAME_PATTERNS = (
@@ -425,6 +427,21 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        # 2/3 factor compensates for the extra gate projection to keep ~same param count as MLP
+        hidden = int(2 / 3 * mlp_mult * dim)
+        hidden = ((hidden + 127) // 128) * 128  # round up to nearest multiple of 128
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.up = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -533,14 +550,18 @@ class GPT(nn.Module):
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Chunked cross-entropy avoids materializing full (B*T, V) logits in fp32
+        chunk_size = 4096
+        total_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
+        bias = None if self.tie_embeddings else (self.lm_head.bias if self.lm_head.bias is not None else None)
+        for i in range(0, x.size(0), chunk_size):
+            x_chunk = x[i : i + chunk_size]
+            t_chunk = targets[i : i + chunk_size]
+            logits_proj = F.linear(x_chunk, weight.to(x_chunk.dtype), bias.to(x_chunk.dtype) if bias is not None else None)
+            logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            total_loss += F.cross_entropy(logits.float(), t_chunk, reduction="sum")
+        return total_loss / targets.numel()
 
 
 # -----------------------------
@@ -551,7 +572,8 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.torch_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -633,6 +655,13 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    # FFN factory based on ffn_type
+    ffn_factory = None
+    if args.ffn_type == "swiglu":
+        ffn_factory = lambda dim, mlp_mult: SwiGLU(dim, mlp_mult)
+    elif args.ffn_type != "relu_sq":
+        raise ValueError(f"Unknown FFN_TYPE={args.ffn_type!r}, expected 'relu_sq' or 'swiglu'")
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -645,12 +674,16 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        ffn_factory=ffn_factory,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False)
+    if args.torch_compile:
+        compiled_model = torch.compile(base_model, dynamic=False)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -705,6 +738,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"ffn_type:{args.ffn_type} torch_compile:{args.torch_compile}")
     log0(f"attention_mode:{'gqa' if args.num_kv_heads != args.num_heads else 'mha'} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -740,6 +774,7 @@ def main() -> None:
                     "tie_embeddings": args.tie_embeddings,
                     "matrix_lr": args.matrix_lr,
                     "scalar_lr": args.scalar_lr,
+                    "ffn_type": args.ffn_type,
                     "n_params": n_params,
                     "world_size": world_size,
                 },
