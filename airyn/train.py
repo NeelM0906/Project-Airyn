@@ -98,6 +98,8 @@ class Hyperparameters:
     n_shared_experts = int(os.environ.get("N_SHARED_EXPERTS", 1))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))  # 0 to disable
     grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 0))  # 0 = auto-compute to keep ~524k tokens per step
+    ckpt_every = int(os.environ.get("CKPT_EVERY", 500))  # save checkpoint every N steps (0 = only at end)
+    resume_from = os.environ.get("RESUME_FROM", "")  # path to checkpoint to resume from
 
 # Parameter name patterns identifying control/scalar tensors (optimizer split).
 CONTROL_TENSOR_NAME_PATTERNS = (
@@ -645,6 +647,29 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+
+
+def save_checkpoint(
+    path: str,
+    base_model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    step: int,
+    args: Hyperparameters,
+) -> None:
+    """Save model, optimizer states, and training progress."""
+    ckpt = {
+        "model_state_dict": base_model.state_dict(),
+        "optimizer_states": [opt.state_dict() for opt in optimizers],
+        "step": step,
+        "run_id": args.run_id,
+        "train_batch_tokens": args.train_batch_tokens,
+        "train_seq_len": args.train_seq_len,
+        "iterations": args.iterations,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(ckpt, path)
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -833,6 +858,17 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    # --- Resume from checkpoint ---
+    start_step = 0
+    if args.resume_from and os.path.isfile(args.resume_from):
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        base_model.load_state_dict(ckpt["model_state_dict"])
+        for opt, opt_state in zip(optimizers, ckpt["optimizer_states"], strict=True):
+            opt.load_state_dict(opt_state)
+        start_step = ckpt.get("step", 0) + 1
+        if rank == 0:
+            print(f"Resumed from {args.resume_from} at step {start_step}")
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     if args.ffn_type == "moe":
@@ -912,7 +948,7 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    if args.warmup_steps > 0:
+    if args.warmup_steps > 0 and start_step == 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -946,7 +982,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for step in range(args.iterations + 1):
+    for step in range(start_step, args.iterations + 1):
         last_step = step == args.iterations
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
@@ -996,6 +1032,14 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # Periodic checkpoint save
+        if args.ckpt_every > 0 and (step + 1) % args.ckpt_every == 0 and master_process:
+            ckpt_path = f"checkpoints/{args.run_id}_step{step + 1}.pt"
+            save_checkpoint(ckpt_path, base_model, optimizers, step + 1, args)
+            log0(f"Checkpoint saved: {ckpt_path}")
+        if distributed and args.ckpt_every > 0 and (step + 1) % args.ckpt_every == 0:
+            dist.barrier()
+
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = args.train_log_every > 0 and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0)
         if should_log_train:
@@ -1028,10 +1072,11 @@ def main() -> None:
     # -----------------------------
 
     if master_process:
-        os.makedirs("checkpoints", exist_ok=True)
         ckpt_path = f"checkpoints/{args.run_id}.pt"
-        torch.save(base_model.state_dict(), ckpt_path)
-        log0(f"Saved checkpoint: {ckpt_path} ({os.path.getsize(ckpt_path)} bytes)")
+        save_checkpoint(ckpt_path, base_model, optimizers, args.iterations, args)
+        log0(f"Saved final checkpoint: {ckpt_path} ({os.path.getsize(ckpt_path)} bytes)")
+    if distributed:
+        dist.barrier()
 
     if _wandb_active:
         wandb.finish()
