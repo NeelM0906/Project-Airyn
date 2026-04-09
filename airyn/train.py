@@ -1029,7 +1029,7 @@ def main() -> None:
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             if _wandb_active:
-                wandb.log({"val/loss": val_loss, "tokens_seen": tokens_seen}, step=step)
+                wandb.log({"step": step, "val/loss": val_loss, "val/tokens_seen": tokens_seen}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1080,13 +1080,23 @@ def main() -> None:
         # Log to wandb every step for full-resolution loss curves
         if _wandb_active:
             current_lr = scale * args.matrix_lr
-            wandb.log({
+            step_time_ms = approx_training_time_ms / (step + 1 - start_step) if (step + 1 - start_step) > 0 else 0
+            metrics = {
                 "step": step + 1,
                 "train/loss": train_loss.item(),
                 "train/lr": current_lr,
+                "train/lr_scale": scale,
                 "train/tokens_seen": tokens_seen,
                 "train/throughput_tok_per_sec": throughput,
-            }, step=step + 1)
+                "train/step_time_ms": step_time_ms,
+                "train/muon_momentum": muon_momentum,
+                "gpu/memory_allocated_mb": torch.cuda.max_memory_allocated() / (1024 * 1024),
+                "gpu/memory_reserved_mb": torch.cuda.max_memory_reserved() / (1024 * 1024),
+            }
+            if args.grad_clip_norm > 0:
+                total_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), float("inf"))
+                metrics["train/grad_norm"] = total_norm.item()
+            wandb.log(metrics, step=step + 1)
 
         # Console/file logging at reduced frequency
         should_log_train = args.train_log_every > 0 and (step + 1 <= 10 or (step + 1) % args.train_log_every == 0)
