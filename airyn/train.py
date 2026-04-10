@@ -97,6 +97,9 @@ class Hyperparameters:
     n_shared_experts = int(os.environ.get("N_SHARED_EXPERTS", 1))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))  # 0 to disable
     grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 0))  # 0 = auto-compute to keep ~524k tokens per step
+    precision = os.environ.get("PRECISION", "bf16")  # "bf16" | "fp8"
+    attn_type = os.environ.get("ATTN_TYPE", "mha")  # "mha" | "kda" | "hybrid_kda_mha"
+    kda_mla_ratio = int(os.environ.get("KDA_MLA_RATIO", 3))  # in hybrid: N KDA layers per 1 MHA layer
     ckpt_every = int(os.environ.get("CKPT_EVERY", 500))  # save checkpoint every N steps (0 = only at end)
     resume_from = os.environ.get("RESUME_FROM", "")  # path to checkpoint to resume from
 
@@ -354,9 +357,46 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
+    def __init__(self, *args, use_fp8: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_fp8 = use_fp8
+
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_fp8:
+            return fp8_linear(x, self.weight, self.bias)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+def fp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    """FP8 linear using torch._scaled_mm with dynamic per-tensor scaling."""
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])  # _scaled_mm requires 2D inputs
+
+    # Dynamic per-tensor scaling for E4M3 (max representable value = 448)
+    E4M3_MAX = 448.0
+    x_amax = x_2d.detach().abs().amax().clamp(min=1e-12)
+    w_amax = weight.detach().abs().amax().clamp(min=1e-12)
+    x_scale = (E4M3_MAX / x_amax).float()
+    w_scale = (E4M3_MAX / w_amax).float()
+
+    # Cast to FP8 E4M3 with scaling
+    x_fp8 = (x_2d.float() * x_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    w_fp8 = (weight.float() * w_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+
+    # _scaled_mm: C = (A @ B^T) * (1/scale_a) * (1/scale_b)
+    # We pass inverse scales so the output is in the original magnitude
+    out = torch._scaled_mm(
+        x_fp8, w_fp8.t(),
+        scale_a=(1.0 / x_scale),
+        scale_b=(1.0 / w_scale),
+        out_dtype=x.dtype,
+        use_fast_accum=True,
+    )
+
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out.reshape(*orig_shape[:-1], weight.shape[0])
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -540,6 +580,28 @@ class MoELayer(nn.Module):
         return output.reshape(bsz, seqlen, dim)
 
 
+class KDAWrapper(nn.Module):
+    """Wraps FLA's KimiDeltaAttention to match our attn_factory interface."""
+
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int = None,
+                 rope_base: float = 10000.0, qk_gain_init: float = 1.5, layer_idx: int = 0):
+        super().__init__()
+        from fla.layers import KimiDeltaAttention
+        head_dim = dim // num_heads
+        self.kda = KimiDeltaAttention(
+            hidden_size=dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            layer_idx=layer_idx,
+        )
+
+    @torch._dynamo.disable
+    def forward(self, x: Tensor) -> Tensor:
+        # FLA KDA returns (output, attn_weights, cache)
+        out, _, _ = self.kda(x)
+        return out
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -710,7 +772,7 @@ def main() -> None:
         if not os.environ.get("NUM_KV_HEADS"):
             args.num_kv_heads = args.num_heads
 
-    model_torch_compile = args.torch_compile and args.ffn_type != "moe"
+    model_torch_compile = args.torch_compile and args.ffn_type != "moe" and args.attn_type == "mha"
     if args.torch_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -832,6 +894,25 @@ def main() -> None:
     elif args.ffn_type != "relu_sq":
         raise ValueError(f"Unknown FFN_TYPE={args.ffn_type!r}, expected 'relu_sq', 'swiglu', or 'moe'")
 
+    # --- Attention factory based on attn_type ---
+    attn_factory = None
+    if args.attn_type == "kda":
+        def attn_factory(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, _counter=[0]):
+            idx = _counter[0]
+            _counter[0] += 1
+            return KDAWrapper(dim, num_heads, layer_idx=idx)
+    elif args.attn_type == "hybrid_kda_mha":
+        ratio = args.kda_mla_ratio
+        def attn_factory(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, _counter=[0]):
+            idx = _counter[0]
+            _counter[0] += 1
+            if idx % (ratio + 1) == ratio:
+                return CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+            else:
+                return KDAWrapper(dim, num_heads, layer_idx=idx)
+    elif args.attn_type != "mha":
+        raise ValueError(f"Unknown ATTN_TYPE={args.attn_type!r}, expected 'mha', 'kda', or 'hybrid_kda_mha'")
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -844,12 +925,20 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attn_factory=attn_factory,
         ffn_factory=ffn_factory,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Enable FP8 on matmul-heavy CastedLinear layers in transformer blocks
+    if args.precision == "fp8":
+        for block in base_model.blocks:
+            for module in block.modules():
+                if isinstance(module, CastedLinear):
+                    module.use_fp8 = True
+        log0("fp8: enabled on all CastedLinear in transformer blocks")
     for module in base_model.modules():
         if isinstance(module, MoELayer):
             module.expert_bias = module.expert_bias.float()
@@ -858,7 +947,7 @@ def main() -> None:
     else:
         compiled_model = base_model
     ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
-    if args.ffn_type == "moe":
+    if args.ffn_type == "moe" or args.attn_type != "mha":
         ddp_kwargs["find_unused_parameters"] = True
     model: nn.Module = DDP(compiled_model, **ddp_kwargs) if distributed else compiled_model
 
@@ -933,7 +1022,7 @@ def main() -> None:
         log0(f"expert_hidden_dim: {expert_hidden}")
         log0(f"total_params:{n_params:,} active_approx:{n_params - (args.n_experts - args.n_active_experts) * expert_params_per_layer * len(base_model.blocks):,}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"ffn_type:{args.ffn_type} torch_compile:{model_torch_compile}")
+    log0(f"ffn_type:{args.ffn_type} torch_compile:{model_torch_compile} precision:{args.precision} attn_type:{args.attn_type}")
     log0(f"attention_mode:{'gqa' if args.num_kv_heads != args.num_heads else 'mha'} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -985,6 +1074,8 @@ def main() -> None:
                     "grad_clip_norm": args.grad_clip_norm,
                     "ckpt_every": args.ckpt_every,
                     "model_size": args.model_size,
+                    "precision": args.precision,
+                    "attn_type": args.attn_type,
                 },
             )
             # Use training step as the x-axis for all metrics
